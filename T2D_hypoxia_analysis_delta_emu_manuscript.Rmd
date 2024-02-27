@@ -1,0 +1,2147 @@
+---
+title: "The effects of hypoxia on human gut microbiota in individuals with T2DM"
+author: "Alex Gould"
+date: "`r date()`"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: 4
+    number_sections: no
+    latex_engine: xelatex
+---
+
+```{r global options, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, 
+                      warning = FALSE,
+                      error = FALSE,
+                      eval = TRUE,
+                      dev = c('pdf', 'png'), 
+                      fig.align = 'center', 
+                      fig.height = 10, 
+                      fig.width = 10, 
+                      fig.dpi = 300,
+                      fig.pos = "!H",
+                      dpi = 300,
+                      out.extra = "",
+                      message = FALSE, 
+                      cache = FALSE,
+                      #pdf.options(encoding = "ISOLatin9.enc"),
+                      fig.path='figs/') 
+```
+
+```{r load_rout_file}
+## Set analysis directory
+analysis_dir = "XXXX"
+
+## Load .Rdata file
+load(paste0(analysis_dir, "/T2D_hypoxia_analysis_phyloseq_object_emu.Rdata"))
+```
+
+``` {r SET_parameters}
+min_otus         = 20000
+nclass           = 15 
+group_cols       = c('Pre-Sham'         = "#E69F00", 
+                     'Post-Sham'        = "#56B4E9",
+                     'Pre-Hypoxia'      = "#009E73",
+                     'Post-Hypoxia'     = "#777711",
+                     'Sham'             = "#7f0042", 
+                     'Hypoxia'          = "#4a77e4"
+                     )
+custom_col16     = c("#771155","#AA4488", "#CC99BB", "#114477", "#4477AA", "#117777", "#77CCCC", "#117744", 
+                     "#88CCAA", "#777711", "#AAAA44", "#DDDD77", "#774411", "#AA7744", "#DDAA77", "#771122")
+test_type        = "non-parametric"
+control_delta    = "Sham"
+otu_or_asv       = "OTU"
+rep_shapes       = c(15, 16, 17, 18, 3, 7, 8, 9, 10, 11, 12, 13, 14)
+```
+
+```{r load_packages}
+## Load the libraries
+library(DBI)
+library(RMySQL)
+library(phyloseq)
+library(tidyverse)
+library(xlsx)
+library(qiime2R)
+library(jmv)
+library(ggpubr)
+library(vegan)
+library(plyr)
+library(reshape2)
+library(DESeq2)
+library(ALDEx2)
+library(scales)
+library(ggtext)
+library(rstatix)
+
+## Set seed for reproducibility
+set.seed(0)
+
+## Set font for figures
+font = element_text(family = "serif")
+```
+
+Fix for `stat_compare_means()` function to allow Times New Roman font.  
+[Thank you](https://stackoverflow.com/questions/77346644/stat-compare-means-unable-to-change-font-family-when-using-comparisons-argu)
+
+```{r stat_compare_means_fix}
+fixed_call <- quote(ggsignif::geom_signif(comparisons = comparisons, 
+                                          y_position = label.y, 
+                                          test = method, test.args = method.args, 
+                                          step_increase = step.increase, 
+                                          size = bracket.size, textsize = 6, color = color, 
+                                          map_signif_level = map_signif_level, 
+                                          tip_length = tip.length, data = data,
+                                          vjust = vjust, ...))
+
+scm <- as.list(ggpubr::stat_compare_means)
+scm[[26]][[2]][[3]][[13]] <- fixed_call
+stat_compare_means <- function(...) {
+  ggp <- getNamespace('ggpubr')
+  .method_info <- ggp$.method_info
+  .add_item <- ggp$.add_item
+  .is_p.signif_in_mapping <- ggp$.is_p.signif_in_mapping
+  .is_empty <- ggp$.is_empty
+  do.call(as.function(scm), list(...), quote = FALSE)
+}
+```
+
+``` {r load_phyloseq_data}
+## Split into samples of interest and positive control data
+phyloseq_dat_PC  <- prune_samples(sample_data(phyloseq_dat_all)[["Group"]] == "PositiveControl", phyloseq_dat_all)
+phyloseq_dat_NFW <- prune_samples(sample_data(phyloseq_dat_all)[["Group"]] == "NegativeControl", phyloseq_dat_all)
+phyloseq_dat     <- prune_samples(!(sample_data(phyloseq_dat_all)[["Group"]] %in% c("PositiveControl", "NegativeControl")), phyloseq_dat_all)
+```
+
+# Section 1: Quality Control - all data
+
+## Rarefaction curve
+We can check our coverage to be sure that we have ample coverage to allow us to detect all species present in these samples. We estimate this by using rarefaction curves, which show the diversity when looking at random subsets of the data. The idea here is that if we have saturated the sample, we should see the same diversity if we only look at a subset of the sample. By looking at the curve of successive sub-populations, we can see at what coverage we see saturation. This will appear as the point at which the curve becomes asymptotic:
+
+``` {r Section1_QC_alldata_rarefaction_curve, cache = TRUE, fig.height = 10, fig.width = 15}
+## Calculate a rarefaction curve (code taken from https://github.com/joey711/phyloseq/issues/143)
+calculate_rarefaction_curves <- function(psdata, measures, depths) {
+  
+  estimate_rarified_richness <- function(psdata, measures, depth) {
+    if(max(sample_sums(psdata)) < depth) return()
+    psdata <- prune_samples(sample_sums(psdata) >= depth, psdata)
+    
+    rarified_psdata <- rarefy_even_depth(psdata, depth, verbose = FALSE)
+    
+    alpha_diversity <- estimate_richness(rarified_psdata, measures = measures)
+    
+    ## as.matrix forces the use of melt.array, which includes the Sample names (rownames)
+    molten_alpha_diversity <- melt(as.matrix(alpha_diversity), varnames = c('Sample', 'Measure'), value.name = 'Alpha_diversity')
+    
+    molten_alpha_diversity
+  }
+  
+  names(depths) <- depths ## this enables automatic addition of the Depth to the output by ldply
+  rarefaction_curve_data <- ldply(depths, estimate_rarified_richness, psdata = psdata, measures = measures, .id = 'Depth', .progress = ifelse(interactive(), 'text', 'none'))
+  
+  ## convert Depth from factor to numeric
+  rarefaction_curve_data$Depth <- as.numeric(levels(rarefaction_curve_data$Depth))[rarefaction_curve_data$Depth]
+  
+  rarefaction_curve_data
+}
+
+## Calculate the rarefaction curve
+set.seed(42)
+rarefaction_curve_data <- calculate_rarefaction_curves(phyloseq_dat, 
+                                                       c('Observed', "Chao1", 'Shannon'), 
+                                                       rep(c(1, 10, 100, 1000, 1:100 * 1000), each = 10))
+
+## Summarize the alpha diversity
+rarefaction_curve_data_summary <- ddply(rarefaction_curve_data, c('Depth', 'Sample', 'Measure'), 
+                                        summarise, 
+                                        Alpha_diversity_mean = mean(Alpha_diversity, na.rm = TRUE), 
+                                        Alpha_diversity_sd = sd(Alpha_diversity, na.rm = TRUE))
+rarefaction_curve_data_summary [["Sample"]] <- gsub("\\.", " ", rarefaction_curve_data_summary [["Sample"]])
+rarefaction_curve_data_summary_verbose <- merge(rarefaction_curve_data_summary, data.frame(sample_data(phyloseq_dat)), by.x = 'Sample', by.y = 'row.names')
+rarefaction_curve_data_summary_verbose[["Depth"]] <- rarefaction_curve_data_summary_verbose[["Depth"]]/1000
+```
+
+### Plot
+
+``` {r Section1_QC_alldata_rarefaction_curve_plot, cache = TRUE, fig.height = 10, fig.width = 15}
+## Plot the rarefaction curve
+rarefaction_curve <- ggplot(data = subset(rarefaction_curve_data_summary_verbose, Measure %in% c('Observed', "Chao1", 'Shannon')),
+              mapping = aes(
+                x = Depth,
+                y = Alpha_diversity_mean,
+                ymin = Alpha_diversity_mean - Alpha_diversity_sd,
+                ymax = Alpha_diversity_mean + Alpha_diversity_sd,
+                colour = Group,
+                shape  = Rep,
+                #group  = Rep,
+                alpha = 0.8)) +
+  geom_line() +
+  geom_pointrange(size = 1) +
+  xlab("Read Depth (1,000s)") +
+  ylab("Alpha Diversity") +
+  scale_fill_manual(values = group_cols) +
+  scale_color_manual(values = group_cols) +
+  scale_shape_manual(values = rep_shapes) +
+  facet_grid(Measure ~ ., scales="free_y") +
+  theme_bw() +
+  theme(
+    text = font,
+    axis.title = element_text(size = 24),
+    axis.text = element_text(size = 18),
+    legend.text = element_text(size = 18),
+    legend.title = element_text(size=18),
+    strip.text.x = element_text(size=24, face = "bold"),
+    strip.text.y = element_text(size=24, face = "bold"))
+
+rarefaction_curve
+
+## reset seed to 0
+set.seed(0)
+```
+
+## Taxa count per sample - All data
+
+The following plot shows the total number of observed taxa (OTUs or ASVs) per sample, with the minimum number of taxa specified above (min_otus) highlighted with a dashed line. Samples lower than this will be removed below in Section 2. 
+
+``` {r Section1_QC_alldata_OTU_count, fig.height = 12, fig.width = 10}
+data.frame(sample_data(phyloseq_dat)) %>%
+  dplyr::mutate(count = sample_sums(phyloseq_dat)) %>%
+  ggplot(aes(x = UIN, y = count/1000, fill = Group)) +
+  geom_bar(stat = "identity", position = "dodge", color = "black") +
+  xlab("") + ylab(paste0("Total Number ", otu_or_asv, "s (x1000)")) +
+  facet_wrap(.~Group, scales = "free_x") +
+  geom_hline(yintercept = min_otus/1000, linetype = 2, linewidth = 1.2) +
+  scale_fill_manual(values = group_cols) +
+  scale_color_manual(values = group_cols) +
+  scale_shape_manual(values = rep_shapes) +
+  theme_bw() +
+  theme(text = font,
+        axis.title   = element_text(size = 18),
+        axis.text.y  = element_text(size = 12),
+        axis.text.x  = element_text(size = 14, angle = 315, face = "bold", hjust = 0),
+        legend.text  = element_text(size = 14),
+        legend.title = element_text(size = 20, face = "bold"),
+        strip.text.x = element_text(size=20, face = "bold"),
+        strip.text.y = element_text(size=16, face = "bold")
+  )
+```
+
+# Section 2: Quality Control - Rarefied and filtered data
+
+## Sample filtering and rarefaction
+
+In this section, the data will be filtered to remove all samples with fewer than `r min_otus` OTUs in the data set. The remaining data will be rarefied to reduce all samples to the same depth, which will be the lowest depth from the remaining samples following filtering.
+
+``` {r Section2_QC_filterdata_filter_and_rarefy_samples, echo = TRUE}
+## Check sample sums
+sample_sums_values <- sample_sums(phyloseq_dat)
+
+## Find samples with sums below 20,000
+samples_below_min_otus <- names(sample_sums_values[sample_sums_values <= min_otus])
+
+## Print
+print(samples_below_min_otus)
+
+## Now identify UIN number to remove
+filter_UIN_to_remove <- sample_data(phyloseq_dat)$Rep[sample_data(phyloseq_dat)$sample_code %in% samples_below_min_otus]
+
+## Print
+print(filter_UIN_to_remove)
+
+## Remove HY09 from analysis as it did not provide samples for Sham condition
+filter_UIN_to_remove <- c(filter_UIN_to_remove, "HY09")
+
+## Print
+print(filter_UIN_to_remove)
+
+## Filter to remove UINs identified above
+phyloseq_dat_filter <- prune_samples(!(sample_data(phyloseq_dat)$Rep %in% filter_UIN_to_remove), phyloseq_dat)
+
+## tax_glom to species level 
+phyloseq_dat_filter <- tax_glom(phyloseq_dat_filter, taxrank = "Species")
+
+## Create a non rarefied phyloseq object with filtered samples for DA analysis
+phyloseq_dat_deseq <- phyloseq_dat_filter
+
+## Rarefy the data to the minimum otu depth
+rarefy_otu_depth <- min(sample_sums(phyloseq_dat_filter))
+cat("Rarefication of data to", rarefy_otu_depth, "OTUs:\n")
+phyloseq_dat_filter <- rarefy_even_depth(phyloseq_dat_filter, rarefy_otu_depth, verbose = FALSE)
+```
+
+### Summary N for Analysis
+
+Below, a summary of the n taken forward for analysis is provided: 
+
+``` {r Section2_n_summary}
+group_data <- sample_data(phyloseq_dat_filter)$Group
+table(group_data)
+```
+
+## Taxa count per sample - Rarefied and filtered data
+
+The following plot shows the total number of observed taxa (OTUs or ASVs) per sample after rarefaction and filtering of samples to remove low coverage samples, with the minimum number of taxa specified above (min_otus) highlighted with a dashed line. Samples lower than this will be removed below in Section 2. All samples should have the same depth. If this is not the case, then please debug the code.
+
+``` {r Section2_QC_filterdata_OTU_count, fig.height = 12, fig.width = 10}
+data.frame(sample_data(phyloseq_dat_filter)) %>%
+  dplyr::mutate(count = sample_sums(phyloseq_dat_filter)) %>%
+  ggplot(aes(x = UIN, y = count/1000, fill = Group)) +
+  geom_bar(stat = "identity", position = "dodge", color = "black") +
+  xlab("") + ylab(paste0("Total Number ", otu_or_asv, "s (x1000)")) +
+  facet_wrap(.~Group, scales = "free_x") +
+  geom_hline(yintercept = min_otus/1000, linetype = 2, linewidth = 1.2) +
+  scale_fill_manual(values = group_cols) +
+  scale_color_manual(values = group_cols) +
+  scale_shape_manual(values = rep_shapes) +
+  theme_bw() +
+  theme(text = font,
+        axis.title   = element_text(size = 18),
+        axis.text.y  = element_text(size = 12),
+        axis.text.x  = element_text(size = 14, angle = 315, face = "bold", hjust = 0),
+        legend.text  = element_text(size = 14),
+        legend.title = element_text(size = 20, face = "bold"),
+        strip.text.x = element_text(size=20, face = "bold"),
+        strip.text.y = element_text(size=16, face = "bold")
+  )
+```
+
+## Alpha diversity - Rarefied and filtered data
+
+### Setup
+
+```{r Section2_QC_filterdata_alpha_diversity_setup}
+## Create alpha diversity data frame
+adiv <- data.frame(
+  "UIN" = phyloseq::sample_data(phyloseq_dat_filter)$UIN,
+  "Rep" = phyloseq::sample_data(phyloseq_dat_filter)$Rep,
+  "Group" = phyloseq::sample_data(phyloseq_dat_filter)$Group,
+  "Observed" = phyloseq::estimate_richness(phyloseq_dat_filter, measures = "Observed"),
+  "Chao1" = phyloseq::estimate_richness(phyloseq_dat_filter, measures = "Chao1"),
+  "Shannon" = phyloseq::estimate_richness(phyloseq_dat_filter, measures = "Shannon"))
+
+adiv <- adiv %>%
+  ## Remove Chao1 SE column
+  dplyr::select(-Chao1.se.chao1) %>%
+  ## Rename Chao1 column
+  dplyr::rename(Chao1 = Chao1.Chao1)
+``` 
+
+### Calculate Delta
+
+```{r Section2_QC_filterdata_alpha_diversity_delta_dataframe}
+## Create delta score for each alpha diversity metric
+observed_delta <- adiv %>%
+  dcast(., Rep ~ Group, value.var = "Observed") %>%
+  mutate(Sham = `Post-Sham` - `Pre-Sham`,
+         Hypoxia = `Post-Hypoxia` - `Pre-Hypoxia`) %>%
+  select(Rep, Sham, Hypoxia) %>%
+  pivot_longer(
+    cols = c(Sham, Hypoxia),
+    names_to = "Group",
+    values_to = "Observed")
+
+chao1_delta <- adiv %>%
+  dcast(., Rep ~ Group, value.var = "Chao1") %>%
+  mutate(Sham = `Post-Sham` - `Pre-Sham`,
+         Hypoxia = `Post-Hypoxia` - `Pre-Hypoxia`) %>%
+  select(Rep, Sham, Hypoxia) %>%
+  pivot_longer(
+    cols = c(Sham, Hypoxia),
+    names_to = "Group",
+    values_to = "Chao1")
+
+shannon_delta <- adiv %>%
+  dcast(., Rep ~ Group, value.var = "Shannon") %>%
+  mutate(Sham = `Post-Sham` - `Pre-Sham`,
+         Hypoxia = `Post-Hypoxia` - `Pre-Hypoxia`) %>%
+  select(Rep, Sham, Hypoxia) %>%
+  pivot_longer(
+    cols = c(Sham, Hypoxia),
+    names_to = "Group",
+    values_to = "Shannon")
+
+## Combine the three data frames into one
+adiv_delta <- observed_delta %>%
+  left_join(chao1_delta, by = c("Rep", "Group")) %>%
+  left_join(shannon_delta, by = c("Rep", "Group"))
+
+## Set factor levels
+adiv_delta[["Group"]] <- factor(adiv_delta[["Group"]], levels = c("Sham", "Hypoxia")) 
+```
+
+### Normality
+
+```{r Section2_QC_filterdata_alpha_diversity_delta_normality}
+jmv::descriptives(
+    formula = Observed + Chao1 + Shannon ~ Group,
+    data = adiv_delta,
+    iqr = TRUE,
+    skew = TRUE,
+    kurt = TRUE,
+    sw = TRUE)
+```
+
+### t-test and effect size
+
+```{r Section2_QC_filterdata_alpha_diversity_delta_stats}
+## Pivot wider
+adiv_delta_wide <- adiv_delta %>%
+  tidyr::pivot_wider(
+    names_from = Group,
+    values_from = c(Observed, Chao1, Shannon),
+    names_sep = "_"
+  )
+
+## Paired t test: students t-test
+ttestPS(data = adiv_delta_wide, 
+        pairs = list(
+          list(
+            i1="Observed_Sham",
+            i2="Observed_Hypoxia"),
+          list(
+            i1="Chao1_Sham",
+            i2="Chao1_Hypoxia"),
+          list(
+            i1="Shannon_Sham",
+            i2="Shannon_Hypoxia")),
+    effectSize = TRUE)
+```
+
+### Plot
+
+```{r Section2_QC_filterdata_alpha_diversity_delta_comparison_plot, fig.height = 8, fig.width = 12}
+## Plot alpha diversity
+adiv_plot <- adiv_delta %>%
+  tidyr::gather(key = metric, value = value, c("Observed", "Chao1", "Shannon")) %>%
+  dplyr::mutate(metric = factor(metric, levels = c("Observed", "Chao1", "Shannon"))) %>%
+  ggplot(aes(x = Group, y = value)) +
+  geom_boxplot(aes(colour = Group),
+               outlier.color = NA) +
+  geom_point(aes(group = Rep, colour = Group),
+             size = 4) +
+  geom_line(aes(group = Rep, colour = "black"),
+            alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  labs(x = "",
+       y = "Δ Alpha Diversity") +
+  facet_wrap(~ metric, scales = "free") +
+  stat_compare_means(comparisons = list(c("Sham", "Hypoxia")),
+                     method = "t.test", 
+                     label = "p.signif",
+                     paired = TRUE,
+                     family = "serif",
+                     bracket.size = 0.6,
+                     tip.length = 0,
+                     vjust = -0.2) +
+  scale_fill_manual(values = group_cols) +
+  scale_color_manual(values = group_cols) +
+  theme_classic() +
+  theme(
+    text = font,
+    axis.title   = element_text(size = 24),
+    axis.text.y  = element_text(size = 16),
+    axis.text.x  = element_text(size = 22),
+    strip.text = element_text(size=26),
+    legend.position = "none"
+    ) 
+
+adiv_plot
+``` 
+
+## Beta diversity - Rarefied and filtered data
+
+The following principal coordinate analysis (PCoA) plot shows the beta diversity following rarefaction and filtering of samples, based on the Bray Curtis distance between samples. 
+
+``` {r Section2_QC_filterdata_beta_diversity, fig.height = 7, fig.width = 9.5}
+bdiv_plot <- plot_ordination(phyloseq_dat_filter, 
+                             ordinate(phyloseq_dat_filter, 
+                                      method = "PCoA", 
+                                      distance = "bray", 
+                                      na.rm = TRUE), 
+                             type = "samples", 
+                             color = "Group") + 
+  stat_ellipse(aes(group = Group), 
+               linetype = 2,
+               linewidth = 1) +
+  geom_point(size = 4,
+             alpha = 0.8) +
+  ggtitle("") + 
+  scale_fill_manual(values = group_cols) +
+  scale_color_manual(values = group_cols) +
+  coord_fixed(1) +
+  theme_classic() +
+  theme(
+    text = font,
+    axis.title = element_text(size = 20),
+    axis.text = element_text(size = 16),
+    legend.text = element_text(size = 18),
+    legend.title = element_text(size=22, face = "bold")
+    )
+
+bdiv_plot
+```
+
+## PERMANOVA
+
+This section will use permutational MANOVA (PERMANOVA) to look for significant effects of the Group variable on the abundance. Dissimilarity is again based on the Bray Curtis difference. 
+
+``` {r Section2_PERMANOVA_analysis}
+## Set seed for reproducibility 
+set.seed(0)
+
+## Convert the counts across all samples into a community data matrix
+plot_dat <- psmelt(phyloseq_dat_filter)
+community_mat <- plot_dat %>%
+  select(Sample, OTU, Abundance) %>%
+  spread(OTU, Abundance)
+row.names(community_mat) <- community_mat[["Sample"]]
+community_mat <- as.matrix(community_mat[, -1]) ## Remove the Sample column
+
+## Transform the data using square root to minimize influence of most abundant groups
+community_mat <- sqrt(community_mat)
+
+## Create a dissimilarity matrix
+OTU_dist <- vegdist(community_mat, method = "bray")
+
+## Get the matching sample data
+ind_dat <- plot_dat %>%
+  select(Sample, Group, UIN) %>%
+  distinct()
+ind_dat <- ind_dat[match(rownames(community_mat), ind_dat[["Sample"]]), ]
+
+## Run perMANOVA
+perm <- adonis2(OTU_dist ~ Group, data = ind_dat, permutations = 9999, method = "bray")
+perm
+```
+
+# Section 3: Microbial Abundance
+
+## Normalise
+
+Here we normalise the taxa counts to represent the percentage of all taxas.
+
+``` {r Section3_normalise}
+phyloseq_dat_filter_norm <- transform_sample_counts(phyloseq_dat_filter, function (x) 100* ((x+1) / sum(x+1)))
+phyloseq_dat_filter_norm_melt <- psmelt(phyloseq_dat_filter_norm)
+
+## melted phyloseq object on non-rarefied data for DESeq2
+phyloseq_dat_norm_melt <- psmelt(phyloseq_dat_deseq)
+```
+
+## Summarise 
+
+Here we summarise the unique taxa at each taxonomic level on the non-rarefied, count data.
+
+``` {r Section3_summarise_taxa}
+## print unique taxas
+unique(phyloseq_dat_norm_melt$Phylum)
+unique(phyloseq_dat_norm_melt$Class)
+unique(phyloseq_dat_norm_melt$Order)
+unique(phyloseq_dat_norm_melt$Family)
+unique(phyloseq_dat_norm_melt$Genus)
+
+## summerise unique taxas by group
+taxa_summary <- phyloseq_dat_norm_melt %>%
+  dplyr::filter(!is.na(Phylum),
+                !is.na(Class),
+                !is.na(Order),
+                !is.na(Family),
+                !is.na(Genus),
+                !is.na(OTU)) %>%
+  dplyr::group_by(Group) %>%
+  dplyr::filter(Abundance >= 10) %>%
+  dplyr::summarise(Unique_Phylum = n_distinct(Phylum),
+                   Unique_Class = n_distinct(Class),
+                   Unique_Order = n_distinct(Order),
+                   Unique_Family = n_distinct(Family),
+                   Unique_Genus = n_distinct(Genus),
+                   Unique_OTU = n_distinct(OTU))
+
+taxa_summary
+```
+
+### Comparison Function
+
+```{r Section3_summarise_function}
+compare_taxa_presence <- function(data, group1, group2, taxonomic_level, group1_name = group1, group2_name = group2) {
+  ## Extract taxonomic names for each group
+  group1_taxa <- data %>%
+    filter(Group == group1) %>%
+    filter(Abundance >= 10) %>%
+    distinct(!!sym(taxonomic_level)) %>%
+    pull(!!sym(taxonomic_level))
+  
+  group2_taxa <- data %>%
+    filter(Group == group2) %>%
+    filter(Abundance >= 10) %>%
+    distinct(!!sym(taxonomic_level)) %>%
+    pull(!!sym(taxonomic_level))
+  
+  ## Combine and deduplicate taxa from both groups
+  all_taxa <- unique(c(group1_taxa, group2_taxa))
+  
+  ## Create a data frame with all taxa
+  taxa_presence <- tibble(Taxa = all_taxa)
+  
+  ## Mark presence or absence in each group
+  taxa_presence <- taxa_presence %>%
+    mutate("{group1_name}" := Taxa %in% group1_taxa,
+           "{group2_name}" := Taxa %in% group2_taxa)
+
+  return(taxa_presence)
+}
+
+summarise_taxa_differences <- function(taxa_comparison, pre_group_name, post_group_name) {
+  ## Convert to logical values for calculation
+  taxa_comparison[[pre_group_name]] <- taxa_comparison[[pre_group_name]] == "TRUE"
+  taxa_comparison[[post_group_name]] <- taxa_comparison[[post_group_name]] == "TRUE"
+  
+  ## Calculate counts
+  both_groups <- sum(taxa_comparison[[pre_group_name]] & taxa_comparison[[post_group_name]])
+  only_pre_group <- sum(taxa_comparison[[pre_group_name]] & !taxa_comparison[[post_group_name]])
+  only_post_group <- sum(!taxa_comparison[[pre_group_name]] & taxa_comparison[[post_group_name]])
+  
+  ## Create a summary tibble
+  summary_tibble <- tibble(
+    `Shared between groups` = both_groups,
+    `Unique to Pre` = only_pre_group,
+    `Unique to Post` = only_post_group
+  )
+  
+  return(summary_tibble)
+}
+```
+
+### Phylum
+
+```{r Section3_summarise_phylum}
+## Compare Pre-Sham vs Post-Sham at the Phylum level
+phylum_comparison_sham <- compare_taxa_presence(data = phyloseq_dat_norm_melt, 
+                                                group1 = "Pre-Sham", 
+                                                group2 = "Post-Sham", 
+                                                taxonomic_level = "Phylum")
+
+## Compare Pre-Hypoxia vs Post-Hypoxia at the Phylum level
+phylum_comparison_hypoxia <- compare_taxa_presence(data = phyloseq_dat_norm_melt, 
+                                                   group1 = "Pre-Hypoxia", 
+                                                   group2 = "Post-Hypoxia", 
+                                                   taxonomic_level = "Phylum")
+
+## Print results
+print(phylum_comparison_sham)
+print(phylum_comparison_hypoxia)
+
+## Summarise differences for Pre-Sham vs Post-Sham at the Phylum level
+summary_sham_phylum <- summarise_taxa_differences(phylum_comparison_sham, "Pre-Sham", "Post-Sham")
+print(summary_sham_phylum)
+
+## Summarise differences for Pre-Hypoxia vs Post-Hypoxia at the Phylum level
+summary_hypoxia_phylum <- summarise_taxa_differences(phylum_comparison_hypoxia, "Pre-Hypoxia", "Post-Hypoxia")
+print(summary_hypoxia_phylum)
+```
+
+### Class
+
+```{r Section3_summarise_class}
+## Compare Pre-Sham vs Post-Sham at the Class level
+class_comparison_sham <- compare_taxa_presence(data = phyloseq_dat_norm_melt, 
+                                                group1 = "Pre-Sham", 
+                                                group2 = "Post-Sham", 
+                                                taxonomic_level = "Class")
+
+## Compare Pre-Hypoxia vs Post-Hypoxia at the Class level
+class_comparison_hypoxia <- compare_taxa_presence(data = phyloseq_dat_norm_melt, 
+                                                   group1 = "Pre-Hypoxia", 
+                                                   group2 = "Post-Hypoxia", 
+                                                   taxonomic_level = "Class")
+
+## Print results
+print(class_comparison_sham)
+print(class_comparison_hypoxia)
+
+## Summarise differences for Pre-Sham vs Post-Sham at the Class level
+summary_sham_class <- summarise_taxa_differences(class_comparison_sham, "Pre-Sham", "Post-Sham")
+print(summary_sham_class)
+
+## Summarise differences for Pre-Hypoxia vs Post-Hypoxia at the Class level
+summary_hypoxia_class <- summarise_taxa_differences(class_comparison_hypoxia, "Pre-Hypoxia", "Post-Hypoxia")
+print(summary_hypoxia_class)
+```
+
+### Order
+
+```{r Section3_summarise_order}
+## Compare Pre-Sham vs Post-Sham at the Order level
+order_comparison_sham <- compare_taxa_presence(data = phyloseq_dat_norm_melt, 
+                                                group1 = "Pre-Sham", 
+                                                group2 = "Post-Sham", 
+                                                taxonomic_level = "Order")
+
+## Compare Pre-Hypoxia vs Post-Hypoxia at the Order level
+order_comparison_hypoxia <- compare_taxa_presence(data = phyloseq_dat_norm_melt, 
+                                                   group1 = "Pre-Hypoxia", 
+                                                   group2 = "Post-Hypoxia", 
+                                                   taxonomic_level = "Order")
+
+## Print results
+print(order_comparison_sham)
+print(order_comparison_hypoxia)
+
+## Summarise differences for Pre-Sham vs Post-Sham at the Order level
+summary_sham_order <- summarise_taxa_differences(order_comparison_sham, "Pre-Sham", "Post-Sham")
+print(summary_sham_order)
+
+## Summarise differences for Pre-Hypoxia vs Post-Hypoxia at the Order level
+summary_hypoxia_order <- summarise_taxa_differences(order_comparison_hypoxia, "Pre-Hypoxia", "Post-Hypoxia")
+print(summary_hypoxia_order)
+```
+
+### Family
+
+```{r Section3_summarise_family}
+## Compare Pre-Sham vs Post-Sham at the Family level
+family_comparison_sham <- compare_taxa_presence(data = phyloseq_dat_norm_melt, 
+                                                group1 = "Pre-Sham", 
+                                                group2 = "Post-Sham", 
+                                                taxonomic_level = "Family")
+
+## Compare Pre-Hypoxia vs Post-Hypoxia at the Family level
+family_comparison_hypoxia <- compare_taxa_presence(data = phyloseq_dat_norm_melt, 
+                                                   group1 = "Pre-Hypoxia", 
+                                                   group2 = "Post-Hypoxia", 
+                                                   taxonomic_level = "Family")
+
+## Print results
+print(family_comparison_sham)
+print(family_comparison_hypoxia)
+
+## Summarise differences for Pre-Sham vs Post-Sham at the Family level
+summary_sham_family <- summarise_taxa_differences(family_comparison_sham, "Pre-Sham", "Post-Sham")
+print(summary_sham_family)
+
+## Summarise differences for Pre-Hypoxia vs Post-Hypoxia at the Family level
+summary_hypoxia_family <- summarise_taxa_differences(family_comparison_hypoxia, "Pre-Hypoxia", "Post-Hypoxia")
+print(summary_hypoxia_family)
+```
+
+### Genus
+
+```{r Section3_summarise_genus}
+## Compare Pre-Sham vs Post-Sham at the Genus level
+genus_comparison_sham <- compare_taxa_presence(data = phyloseq_dat_norm_melt, 
+                                                group1 = "Pre-Sham", 
+                                                group2 = "Post-Sham", 
+                                                taxonomic_level = "Genus")
+
+## Compare Pre-Hypoxia vs Post-Hypoxia at the Genus level
+genus_comparison_hypoxia <- compare_taxa_presence(data = phyloseq_dat_norm_melt, 
+                                                   group1 = "Pre-Hypoxia", 
+                                                   group2 = "Post-Hypoxia", 
+                                                   taxonomic_level = "Genus")
+
+## Print results
+print(genus_comparison_sham)
+print(genus_comparison_hypoxia)
+
+## Summarise differences for Pre-Sham vs Post-Sham at the Genus level
+summary_sham_genus <- summarise_taxa_differences(genus_comparison_sham, "Pre-Sham", "Post-Sham")
+print(summary_sham_genus)
+
+## Summarise differences for Pre-Hypoxia vs Post-Hypoxia at the Genus level
+summary_hypoxia_genus <- summarise_taxa_differences(genus_comparison_hypoxia, "Pre-Hypoxia", "Post-Hypoxia")
+print(summary_hypoxia_genus)
+```
+
+### OTU
+
+```{r Section3_summarise_otu}
+## Compare Pre-Sham vs Post-Sham at the OTU level
+otu_comparison_sham <- compare_taxa_presence(data = phyloseq_dat_norm_melt, 
+                                                group1 = "Pre-Sham", 
+                                                group2 = "Post-Sham", 
+                                                taxonomic_level = "OTU")
+
+## Compare Pre-Hypoxia vs Post-Hypoxia at the OTU level
+otu_comparison_hypoxia <- compare_taxa_presence(data = phyloseq_dat_norm_melt, 
+                                                   group1 = "Pre-Hypoxia", 
+                                                   group2 = "Post-Hypoxia", 
+                                                   taxonomic_level = "OTU")
+
+## Print results
+print(otu_comparison_sham)
+print(otu_comparison_hypoxia)
+
+## Summarise differences for Pre-Sham vs Post-Sham at the OTU level
+summary_sham_otu <- summarise_taxa_differences(otu_comparison_sham, "Pre-Sham", "Post-Sham")
+print(summary_sham_otu)
+
+## Summarise differences for Pre-Hypoxia vs Post-Hypoxia at the OTU level
+summary_hypoxia_otu <- summarise_taxa_differences(otu_comparison_hypoxia, "Pre-Hypoxia", "Post-Hypoxia")
+print(summary_hypoxia_otu)
+```
+
+## Individual Barplots
+
+The following functions will plot a barplot showing the normalised abundance across all samples.
+
+### Barplot function: Normal text
+
+``` {r Section3_plot_barplot_normal_text}
+plot_barplot <- function (taxa, plot_dat = phyloseq_dat_filter_norm_melt, nclass = 15) {
+
+  ## Get the total abundance across all samples for each OTU
+  tmp <- plot_dat %>% 
+    dplyr::group_by(OTU) %>% 
+    dplyr::summarise(sum = sum(Abundance))
+  tsums <- tmp[["sum"]]
+  names(tsums) <- tmp[["OTU"]]
+  tsums <- tsums[order(names(tsums))]
+  
+  ## Get the OTU taxa
+  tmp <- subset(plot_dat, Sample == plot_dat[1, "Sample"])
+  taxlist <- tmp[, taxa]
+  names(taxlist) <- tmp[, "OTU"]
+  
+  ## Check the data match
+  if (length(tsums) != length(taxlist) || !all(names(tsums) %in% names(taxlist)) || !all(names(taxlist) %in% names(tsums))) {
+    stop("Error: tsums and taxlist do not match.\n")
+  }
+  taxlist <- taxlist[names(tsums)]
+  
+  ## Keep only the top taxa and add all other taxa into an "other" class
+  taxasum <- sort(tapply(tsums, taxlist, sum, na.rm=TRUE), decreasing = TRUE)
+  taxasum <- taxasum[!names(taxasum) == ""]
+  plot_dat[["TaxName"]] <- as.character(plot_dat[[taxa]])
+  plot_dat[is.na(plot_dat[["TaxName"]]) | plot_dat[["TaxName"]] == "", "TaxName"] <- "Other"
+  plot_dat[["TaxName"]] <- ifelse(plot_dat[["TaxName"]] %in% names(taxasum)[1:nclass], as.character(plot_dat[[taxa]]), "Other")
+  plot_dat[["TaxName"]] <- factor(plot_dat[["TaxName"]], levels = c(names(taxasum)[1:nclass], "Other")) 
+  
+  ## Combine counts at the taxa level
+  plot_dat <- plot_dat %>%
+    dplyr::group_by(Sample, Group, Rep, TaxName) %>%
+    dplyr::summarise(Abundance = sum(Abundance)) %>%
+    ## remove "[]", "-", "_" from taxa names
+    dplyr::mutate(TaxName = gsub("\\[|\\]|-|_", " ", TaxName)) %>%
+    ## remove leading and trialing spaces!
+    dplyr::mutate(TaxName = trimws(TaxName)) %>%
+    ## remove instances of doubles spaces
+    dplyr::mutate(TaxName = gsub("  ", " ", TaxName))
+  
+    ## Extract unique and edited TaxName values
+    unique_taxa <- unique(plot_dat$TaxName)
+ 
+  ## reset factor levels again
+  plot_dat <- plot_dat %>%
+    dplyr::mutate(TaxName = factor(TaxName, levels = unique_taxa))
+
+  ## Create a colour pallet for the barplot
+  set.seed(0)
+  cols <- sample(custom_col16, length(unique(plot_dat[["TaxName"]])))
+  names(cols) <- unique(plot_dat[["TaxName"]])
+  cols["Other"] <- "#D3D3D3"
+  
+    p <- plot_dat %>%
+    ggplot(aes(x = Rep, y = Abundance, fill = TaxName)) + 
+    geom_bar(stat = "identity", width = 1) +
+    labs(x = "", y = "Relative Abundance") +
+    scale_y_continuous(labels = scales::label_percent(scale = 1),
+                       expand = expansion(add = c(0, 1))) +
+    scale_fill_manual(values = cols) +
+    facet_wrap(.~Group, scales = "free_x", ncol = 4) +
+    theme_bw() +
+    theme(
+      text = font,
+      axis.title   = element_text(size = 20),
+      axis.text.y  = element_text(size = 16),
+      axis.text.x  = element_text(angle = 315, hjust = 0, size = 7),
+      legend.text  = element_markdown(size = 14),
+      legend.title = element_blank(),
+      legend.position      = "bottom",
+      legend.justification = "center",
+      legend.margin        = margin(-25, 0, 0, 0),
+      strip.text.x = element_text(size = 16)
+      ) 
+    
+  ## Return the figure and the data set
+  return(list(p, plot_dat))
+}
+```
+
+### Barplot function: Italic text
+
+``` {r Section3_plot_barplot_italic_text}
+plot_barplot2 <- function (taxa, plot_dat = phyloseq_dat_filter_norm_melt, nclass = 15) {
+
+  ## Get the total abundance across all samples for each OTU
+  tmp <- plot_dat %>% 
+    dplyr::group_by(OTU) %>% 
+    dplyr::summarise(sum = sum(Abundance))
+  tsums <- tmp[["sum"]]
+  names(tsums) <- tmp[["OTU"]]
+  tsums <- tsums[order(names(tsums))]
+  
+  ## Get the OTU taxa
+  tmp <- subset(plot_dat, Sample == plot_dat[1, "Sample"])
+  taxlist <- tmp[, taxa]
+  names(taxlist) <- tmp[, "OTU"]
+  
+  ## Check the data match
+  if (length(tsums) != length(taxlist) || !all(names(tsums) %in% names(taxlist)) || !all(names(taxlist) %in% names(tsums))) {
+    stop("Error: tsums and taxlist do not match.\n")
+  }
+  taxlist <- taxlist[names(tsums)]
+  
+  ## Keep only the top taxa and add all other taxa into an "other" class
+  taxasum <- sort(tapply(tsums, taxlist, sum, na.rm=TRUE), decreasing = TRUE)
+  taxasum <- taxasum[!names(taxasum) == ""]
+  plot_dat[["TaxName"]] <- as.character(plot_dat[[taxa]])
+  plot_dat[is.na(plot_dat[["TaxName"]]) | plot_dat[["TaxName"]] == "", "TaxName"] <- "Other"
+  plot_dat[["TaxName"]] <- ifelse(plot_dat[["TaxName"]] %in% names(taxasum)[1:nclass], as.character(plot_dat[[taxa]]), "Other")
+  plot_dat[["TaxName"]] <- factor(plot_dat[["TaxName"]], levels = c(names(taxasum)[1:nclass], "Other")) 
+  
+  ## Combine counts at the taxa level
+  plot_dat <- plot_dat %>%
+    dplyr::group_by(Sample, Group, Rep, TaxName) %>%
+    dplyr::summarise(Abundance = sum(Abundance)) %>%
+    ## remove "[]", "_" from taxa names
+    dplyr::mutate(TaxName = gsub("\\[|\\]|_", " ", TaxName)) %>%
+    ## remove leading and trialing spaces!
+    dplyr::mutate(TaxName = trimws(TaxName)) %>%
+    ## remove instances of double spaces
+    dplyr::mutate(TaxName = gsub("  ", " ", TaxName)) %>%
+    ## Italicising taxa names
+    dplyr::mutate(
+      FormattedTaxName = 
+        ifelse(
+        ## keep uncultured as normal text
+        grepl("^uncultured", TaxName),
+        gsub("^(uncultured) (.+)$", "\\1 *\\2*", TaxName),
+        ## Keep the stated names (e.g. "Other") as normal text (i.e. not italicised) and wrap taxa names with "*"
+        ifelse(TaxName %in% c("Other", 
+                              "metagenome", 
+                              "gut metagenome", 
+                              "human gut",
+                              "human gut metagenome",
+                              "unidentified"
+                              ),
+               TaxName,
+               paste("*", TaxName, "*", sep = "")))) %>%
+    ## insert line break in long taxa names
+    dplyr::mutate(FormattedTaxName = ifelse(FormattedTaxName == "*Ruminococcus torques group*",
+                                            "*Ruminococcus<br>torques group*",
+                                            FormattedTaxName),
+                  FormattedTaxName = ifelse(FormattedTaxName == "*Eubacterium hallii group*",
+                                            "*Eubacterium<br>hallii group*",
+                                            FormattedTaxName),
+                  FormattedTaxName = ifelse(FormattedTaxName == "uncultured *bacterium*",
+                                            "uncultured<br>*bacterium*",
+                                            FormattedTaxName)
+                  )
+
+  ## Extract unique and edited TaxName values
+  unique_taxa <- unique(plot_dat$TaxName)
+  unique_taxa2 <- unique(plot_dat$FormattedTaxName)
+
+  ## reset factor levels again
+  plot_dat <- plot_dat %>%
+    dplyr::mutate(TaxName = factor(TaxName, levels = unique_taxa),
+                  FormattedTaxName = factor(FormattedTaxName, levels = unique_taxa2))
+
+  ## Create a colour pallet for the barplot
+  set.seed(0)
+  cols <- sample(custom_col16, length(unique(plot_dat[["FormattedTaxName"]])))
+  names(cols) <- unique(plot_dat[["FormattedTaxName"]])
+  cols["Other"] <- "#D3D3D3"
+   
+  ## Plot the normalised abundance across the dataset - Stacked plot
+  p <- 
+    plot_dat %>%
+    ggplot(aes(x = Rep, y = Abundance, fill = FormattedTaxName)) + 
+    geom_bar(stat = "identity", width = 1) +
+    labs(x = "", y = "Relative Abundance") +
+    scale_y_continuous(labels = scales::label_percent(scale = 1),
+                       expand = expansion(add = c(0, 1))) +
+    scale_fill_manual(values = cols) +
+    facet_wrap(.~Group, scales = "free_x", ncol = 4) +
+    theme_bw() +
+    theme(
+      text = font,
+      axis.title   = element_text(size = 20),
+      axis.text.y  = element_text(size = 16),
+      axis.text.x  = element_text(angle = 315, hjust = 0, size = 7),
+      legend.text  = element_markdown(size = 14),
+      legend.title = element_blank(),
+      legend.position      = "bottom",
+      legend.justification = "center",
+      legend.margin        = margin(-25, 0, 0, 0),
+      strip.text.x = element_text(size = 16)
+      ) 
+  
+  ## Return the figure and the data set
+  return(list(p, plot_dat))
+}
+```
+
+### Phylum
+``` {r Section3_barplot_top_phylum_normalised_abundance_stacked, fig.height = 8, fig.width = 8}
+phylum_dat <- plot_barplot("Phylum", nclass = 5)
+phylum_barplot <- phylum_dat[[1]]
+phylum_barplot
+```
+
+### Class
+``` {r Section3_barplot_top_class_normalised_abundance_stacked, fig.height = 8, fig.width = 8}
+class_dat <- plot_barplot("Class")
+class_dat[[1]]
+```
+
+### Order
+``` {r Section3_barplot_top_order_normalised_abundance_stacked, fig.height = 8, fig.width = 8}
+order_dat <- plot_barplot("Order")
+order_dat[[1]]
+```
+
+### Family
+``` {r Section3_barplot_top_family_normalised_abundance_stacked, fig.height = 8, fig.width = 8}
+family_dat <- plot_barplot2("Family")
+family_dat[[1]]
+```
+
+### Genus
+``` {r Section3_barplot_top_genus_normalised_abundance_stacked, fig.height = 8, fig.width = 8}
+genus_dat <- plot_barplot2("Genus")
+genus_barplot <- genus_dat[[1]]
+genus_barplot
+```
+
+### Species
+``` {r Section3_barplot_top_species_normalised_abundance_stacked, fig.height = 8, fig.width = 8}
+species_dat <- plot_barplot2("Species")
+species_dat[[1]]
+```
+
+## Firmicute/Bacteroidota ratio
+
+This section will calculate the Firmicute/Bacteroidota (FB) ratio.
+
+```{r Section3_calculate_FBratio}
+fbratio <- phylum_dat[[2]] %>%
+  dplyr::group_by(Rep, Group) %>%
+  tidyr::spread(TaxName, Abundance) %>%
+  dplyr::mutate(FBratio = Firmicutes/Bacteroidota) %>%
+  dplyr::select(Rep, Group, Firmicutes, Bacteroidota, FBratio) 
+```
+
+```{r Section3_calculate_FBratio_delta}
+## Calculate delta fbratio
+fbratio_delta <- fbratio %>%
+  reshape2::dcast(., Rep ~ Group, value.var = "FBratio") %>%
+  dplyr::mutate(Sham = `Post-Sham` - `Pre-Sham`,
+                Hypoxia = `Post-Hypoxia` - `Pre-Hypoxia`) %>%
+  dplyr::select(Rep, Sham, Hypoxia) %>%
+  tidyr::pivot_longer(cols = c(Sham, Hypoxia),
+                      names_to = "Group",
+                      values_to = "FBratio") %>%
+  dplyr::mutate(Group = factor(Group, 
+                                     levels = c("Sham", "Hypoxia")))
+
+
+head(fbratio_delta)
+```
+
+### Normality
+
+```{r Section2_QC_filterdata_fbratio_delta_normality}
+jmv::descriptives(
+    formula = FBratio ~ Group,
+    data = fbratio_delta,
+    iqr = TRUE,
+    skew = TRUE,
+    kurt = TRUE,
+    sw = TRUE)
+```
+
+### t-test and effect size
+
+```{r Section2_QC_filterdata_fbratio_delta_stats}
+## Pivot wider
+fbratio_delta_wide <- fbratio_delta %>%
+  tidyr::pivot_wider(
+    names_from = Group,
+    values_from = c(FBratio),
+    names_sep = "_"
+  )
+
+# ## Paired t-test: students t-test
+# ttestPS(data = fbratio_delta_wide, 
+#         pairs = list(
+#          list(
+#             i1="Sham",
+#             i2="Hypoxia")),
+#     effectSize = TRUE)
+
+## Paired t-test: wilcoxon
+ttestPS(data = fbratio_delta_wide, 
+        pairs = list(
+         list(
+            i1="Sham",
+            i2="Hypoxia")),
+        students = FALSE,
+        wilcoxon = TRUE,
+        effectSize = TRUE)
+```
+
+### Plot
+
+``` {r Section3_FBratio_delta_plot, fig.height = 6, fig.width = 6}
+fbratio_delta_plot <- fbratio_delta %>% 
+  dplyr::mutate(Group = factor(Group, levels = c("Sham", "Hypoxia"))) %>%
+  ggplot(aes(x = Group, y = FBratio, color = Group)) +
+  geom_boxplot(aes(colour = Group),
+               outlier.color = NA) +
+  geom_point(aes(group = Rep, colour = Group),
+             size = 4) +
+  geom_line(aes(group = Rep, colour = "black"),
+            alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  stat_compare_means(comparisons = list(c("Sham", "Hypoxia")),
+                     method = "wilcox.test",
+                     label = "p.signif",
+                     paired = TRUE,
+                     family = "serif",
+                     bracket.size = 0.6,
+                     tip.length = 0,
+                     vjust = -0.2) +
+  labs(x = "", 
+       y = "Δ F/B Ratio") +
+  scale_fill_manual(values = group_cols) +
+  scale_color_manual(values = group_cols) +
+  theme_classic() +
+  theme(
+    text = font,
+    axis.title   = element_text(size = 24),
+    axis.text.y  = element_text(size = 16),
+    axis.text.x  = element_text(size = 22),
+    legend.position = "none"
+    ) 
+
+fbratio_delta_plot
+
+# library(ggbreak)
+# 
+# fbratio_delta_plot2 <- fbratio_delta %>% 
+#   dplyr::mutate(Group = factor(Group, levels = c("Sham", "Hypoxia"))) %>%
+#   ggplot(aes(x = Group, y = FBratio, color = Group)) +
+#   geom_boxplot(aes(colour = Group),
+#                outlier.color = NA) +
+#   geom_point(aes(group = Rep, colour = Group),
+#              size = 4) +
+#   geom_line(aes(group = Rep, colour = "black"),
+#             alpha = 0.6) +
+#   stat_compare_means(comparisons = list(c("Sham", "Hypoxia")),
+#                      method = "wilcox.test",
+#                      label = "p.signif",
+#                      paired = TRUE,
+#                      family = "serif",
+#                      bracket.size = 0.6,
+#                      tip.length = 0,
+#                      vjust = -0.2) +
+#   labs(x = "", 
+#        y = "Δ F/B Ratio") +
+#   scale_y_continuous(breaks = seq(-100, 550, 50),
+#                      limits = c(-100, 600)) +
+#   ## insert y axis break
+#   scale_y_break(c(100, 450)) +
+#   scale_fill_manual(values = group_cols) +
+#   scale_color_manual(values = group_cols) +
+#   theme_classic() +
+#   theme(
+#     text = font,
+#     axis.title   = element_text(size = 24),
+#     axis.text.y  = element_text(size = 16),
+#     axis.text.x  = element_text(size = 22),
+#     legend.position = "none"
+#     ) +
+#   ## remove right axis
+#   theme(axis.text.y.right = element_blank(),
+#         axis.ticks.y.right = element_blank(),
+#         axis.line.y.right = element_blank())
+# 
+# fbratio_delta_plot2
+```
+
+## Relative Abundance Comparison Function
+
+Below, we will compare the delta relative abundances of taxa at given taxonomic levels. 
+
+### Plot function: Normal text
+
+``` {r Section4_plot_abundance_comparison_delta}
+plot_abundance_comparison_delta <- function (taxa, plot_dat = phyloseq_dat_filter_norm_melt, p_type = "individual", nclass = 15) {
+
+  ## Get the total abundance across all samples for each OTU for the given taxa
+  tmp <- plot_dat %>% 
+    dplyr::group_by(OTU) %>% 
+    dplyr::summarise(sum = sum(Abundance))
+  tsums <- tmp[["sum"]]
+  names(tsums) <- tmp[["OTU"]]
+  tsums <- tsums[order(names(tsums))]
+  
+  ## Get the OTU taxa
+  tmp <- subset(plot_dat, Sample == plot_dat[1, "Sample"])
+  taxlist <- tmp[, taxa]
+  names(taxlist) <- tmp[, "OTU"]
+  
+  ## Check the data match
+  if (length(tsums) != length(taxlist) || !all(names(tsums) %in% names(taxlist)) || !all(names(taxlist) %in% names(tsums))) {
+    stop("Error: tsums and taxlist do not match.\n")
+  }
+  taxlist <- taxlist[names(tsums)]
+  
+  ## Keep only the top taxa and add all other taxa into an "other" class
+  taxasum <- sort(tapply(tsums, taxlist, sum, na.rm=TRUE), decreasing = TRUE)
+  taxasum <- taxasum[!names(taxasum) == ""]
+  plot_dat[["TaxName"]] <- as.character(plot_dat[[taxa]])
+  plot_dat[is.na(plot_dat[["TaxName"]]) | plot_dat[["TaxName"]] == "", "TaxName"] <- "Other"
+  plot_dat[["TaxName"]] <- ifelse(plot_dat[["TaxName"]] %in% names(taxasum)[1:nclass], as.character(plot_dat[[taxa]]), "Other")
+  plot_dat[["TaxName"]] <- factor(plot_dat[["TaxName"]], levels = c(names(taxasum)[1:nclass], "Other")) 
+  
+  ## Combine counts at the taxa level
+  plot_dat <- plot_dat %>%
+    dplyr::group_by(Rep, Group, TaxName) %>%
+    dplyr::summarise(Abundance = sum(Abundance)) %>%
+    dplyr::filter(TaxName != "Other") %>%
+    tidyr::pivot_wider(names_from = Group, values_from = Abundance)
+  
+  ## Create Delta change in TaxNames
+  plot_dat <- plot_dat %>%
+    ## calculate deltas for sham & hypoxia
+    dplyr::mutate(Sham = `Post-Sham` - `Pre-Sham`,
+                  Hypoxia = `Post-Hypoxia` - `Pre-Hypoxia`) %>%
+    ## pivot longer
+    tidyr::pivot_longer(cols = c("Sham", "Hypoxia"),
+                        names_to = "Group",
+                        values_to = "Delta") %>%
+    ## set factor levels
+    dplyr::mutate(Group = factor(Group, levels = c("Sham", "Hypoxia"))) %>%
+    dplyr::select(Rep, TaxName, Group, Delta) 
+
+  ## Combine at the Group level
+  plot_dat_SE <- plot_dat %>%
+    dplyr::group_by(Group, TaxName) %>%
+    dplyr::summarise(average = ifelse(test_type == "parametric", 
+                                      mean(Delta), 
+                                      median(Delta)), 
+                     variability = ifelse(test_type == "parametric", 
+                                          sd(Delta)/sqrt(length(Delta)), 
+                                          IQR(Delta)))
+  
+  ## Calculate p-value across all groups
+  pval <- data.frame(TaxName       = head(levels(plot_dat_SE[["TaxName"]]), -1),
+                     pval          = NA)
+  for (t in pval[["TaxName"]]) {
+    if (test_type == "parametric") {
+      pval[pval[["TaxName"]] == t, "pval"] <- anova(lm(Delta ~ Group, data = subset(plot_dat, TaxName == t)))[1, "Pr(>F)"]
+    } else if (test_type == "non-parametric") {
+      pval[pval[["TaxName"]] == t, "pval"] <- kruskal.test(Delta ~ Group, data = subset(plot_dat, TaxName == t))[["p.value"]]
+    }
+  }
+  
+  ## Calculate individual p-values vs control
+  for (t in pval[["TaxName"]]) {
+    for (g in unique(plot_dat[["Group"]])) {
+      if (g == control_delta) {
+        pval[pval[["TaxName"]] == t, paste0("pval.", g)] <- 1
+      } else if (test_type == "parametric") {
+        pval[pval[["TaxName"]] == t, paste0("pval.", g)] <- t.test(subset(plot_dat, 
+                                                                          TaxName == t & Group == g)[["Delta"]],
+                                                                   subset(plot_dat, TaxName == t & Group == control_delta)[["Delta"]], 
+                                                                   paired = TRUE)[["p.value"]]
+      } else if (test_type == "non-parametric") {
+        pval[pval[["TaxName"]] == t, paste0("pval.", g)] <- wilcox.test(subset(plot_dat, 
+                                                                               TaxName == t & Group == g)[["Delta"]], 
+                                                                        subset(plot_dat, 
+                                                                               TaxName == t & Group == control_delta)[["Delta"]],
+                                                                        paired = TRUE)[["p.value"]]
+      }
+    }
+  }
+
+  ## Add to data frame
+  plot_dat_SE[["pval"]] <- NA
+  for (t in pval[["TaxName"]]) {
+    for (g in unique(plot_dat[["Group"]])) {
+      if (p_type == "combine") {
+        if (g == control_delta) {
+          plot_dat_SE[plot_dat_SE[["TaxName"]] == t & plot_dat_SE[["Group"]] == g, "pval"] <- pval[pval[["TaxName"]] == t, "pval"]
+        } else {
+          plot_dat_SE[plot_dat_SE[["TaxName"]] == t & plot_dat_SE[["Group"]] == g, "pval"] <- NA
+        }
+      } else if (p_type == "individual") {
+        if (g == control_delta) {
+          plot_dat_SE[plot_dat_SE[["TaxName"]] == t & plot_dat_SE[["Group"]] == g, "pval"] <- NA
+        } else {
+          plot_dat_SE[plot_dat_SE[["TaxName"]] == t & plot_dat_SE[["Group"]] == g, "pval"] <- pval[pval[["TaxName"]] == t, paste0("pval.", g)]
+        }
+      }
+    }
+  }
+      
+  ## Correct for multiple testing
+  which_nonna <- which(!is.na(plot_dat_SE[["pval"]]))
+  plot_dat_SE[["pval_adj"]] <- NA
+  plot_dat_SE[which_nonna, "pval_adj"] <- p.adjust(as.numeric(plot_dat_SE[which_nonna, ][["pval"]]), method = "fdr", n = nrow(plot_dat_SE[which_nonna, ]))
+  
+  ## Convert to star format
+  plot_dat_SE[["pval_adj_star"]] <- case_when(plot_dat_SE[["pval_adj"]] <= 0.001 ~ "***",
+                                              plot_dat_SE[["pval_adj"]] <= 0.01  ~ "**",
+                                              plot_dat_SE[["pval_adj"]] <= 0.05  ~ "*",
+                                              TRUE ~ "")
+
+  plot_dat_SE %>%
+    ggplot(aes(x = average, 
+               y = reorder(TaxName, average), 
+               color = factor(Group, levels = c("Hypoxia", "Sham"))), ## flip factor level
+               color = Group) +
+    geom_jitter(data = plot_dat,
+                aes(x = Delta, y = reorder(TaxName, Delta),
+                    factor(Group, levels = c("Hypoxia", "Sham")), ## flip factor level
+                    color = Group),
+                position = position_jitterdodge(jitter.width = 0.6),
+                size = 2,
+                alpha = 0.4) +
+    geom_point(position = position_dodge(0.9), 
+               size = 4.5) +
+    geom_errorbarh(aes(xmin = average - variability, 
+                       xmax = average + variability), 
+                   height = 0.4, 
+                   position = position_dodge(0.9)) +
+    labs(x = "Δ Relative Abundance",
+         y = "",
+         color = "Group") +
+    scale_x_continuous(labels = scales::label_percent(scale = 1)) +
+    scale_color_manual(values = group_cols) +
+    theme_classic() +
+    theme(
+      text = font,
+      axis.title.x = element_text(size = 20),
+      axis.text.x = element_text(size = 16),
+      axis.text.y = element_markdown(size = 16, colour = "black"),
+      legend.title = element_text(size = 22, face = "bold"),
+      legend.text  = element_text(size = 18),
+      panel.grid.major.x = element_line(colour = "darkgrey", linewidth = 0.25)
+      )
+}
+```
+
+### Plot function: Italic text
+
+``` {r Section4_plot_abundance_comparison_delta_italic_text}
+plot_abundance_comparison_delta2 <- function (taxa, plot_dat = phyloseq_dat_filter_norm_melt, p_type = "individual", nclass = 15) {
+
+  ## Get the total abundance across all samples for each OTU for the given taxa
+  tmp <- plot_dat %>% 
+    dplyr::group_by(OTU) %>% 
+    dplyr::summarise(sum = sum(Abundance))
+  tsums <- tmp[["sum"]]
+  names(tsums) <- tmp[["OTU"]]
+  tsums <- tsums[order(names(tsums))]
+  
+  ## Get the OTU taxa
+  tmp <- subset(plot_dat, Sample == plot_dat[1, "Sample"])
+  taxlist <- tmp[, taxa]
+  names(taxlist) <- tmp[, "OTU"]
+  
+  ## Check the data match
+  if (length(tsums) != length(taxlist) || !all(names(tsums) %in% names(taxlist)) || !all(names(taxlist) %in% names(tsums))) {
+    stop("Error: tsums and taxlist do not match.\n")
+  }
+  taxlist <- taxlist[names(tsums)]
+  
+  ## Keep only the top taxa and add all other taxa into an "other" class
+  taxasum <- sort(tapply(tsums, taxlist, sum, na.rm=TRUE), decreasing = TRUE)
+  taxasum <- taxasum[!names(taxasum) == ""]
+  plot_dat[["TaxName"]] <- as.character(plot_dat[[taxa]])
+  plot_dat[is.na(plot_dat[["TaxName"]]) | plot_dat[["TaxName"]] == "", "TaxName"] <- "Other"
+  plot_dat[["TaxName"]] <- ifelse(plot_dat[["TaxName"]] %in% names(taxasum)[1:nclass], as.character(plot_dat[[taxa]]), "Other")
+  plot_dat[["TaxName"]] <- factor(plot_dat[["TaxName"]], levels = c(names(taxasum)[1:nclass], "Other")) 
+  
+  ## Combine counts at the taxa level
+  plot_dat <- plot_dat %>%
+    dplyr::group_by(Rep, Group, TaxName) %>%
+    dplyr::summarise(Abundance = sum(Abundance)) %>%
+    dplyr::filter(TaxName != "Other") %>%
+    tidyr::pivot_wider(names_from = Group, values_from = Abundance)
+  
+  ## Create Delta change in TaxNames
+  plot_dat <- plot_dat %>%
+    ## calculate deltas for sham & hypoxia
+    dplyr::mutate(Sham = `Post-Sham` - `Pre-Sham`,
+                  Hypoxia = `Post-Hypoxia` - `Pre-Hypoxia`) %>%
+    ## pivot longer
+    tidyr::pivot_longer(cols = c("Sham", "Hypoxia"),
+               names_to = "Group",
+               values_to = "Delta") %>%
+    ## set factor levels
+    dplyr::mutate(Group = factor(Group, levels = c("Sham", "Hypoxia"))) %>%
+    dplyr::select(Rep, TaxName, Group, Delta) 
+
+  ## Combine at the Group level
+  plot_dat_SE <- plot_dat %>%
+    dplyr::group_by(Group, TaxName) %>%
+    dplyr::summarise(average = ifelse(test_type == "parametric", 
+                                      mean(Delta), 
+                                      median(Delta)), 
+                     variability = ifelse(test_type == "parametric", 
+                                          sd(Delta)/sqrt(length(Delta)), 
+                                          IQR(Delta)))
+  
+  ## Calculate p-value across all groups
+  pval <- data.frame(TaxName       = head(levels(plot_dat_SE[["TaxName"]]), -1),
+                     pval          = NA)
+  for (t in pval[["TaxName"]]) {
+    if (test_type == "parametric") {
+      pval[pval[["TaxName"]] == t, "pval"] <- anova(lm(Delta ~ Group, data = subset(plot_dat, TaxName == t)))[1, "Pr(>F)"]
+    } else if (test_type == "non-parametric") {
+      pval[pval[["TaxName"]] == t, "pval"] <- kruskal.test(Delta ~ Group, data = subset(plot_dat, TaxName == t))[["p.value"]]
+    }
+  }
+  
+  ## Calculate individual p-values vs control
+  for (t in pval[["TaxName"]]) {
+    for (g in unique(plot_dat[["Group"]])) {
+      if (g == control_delta) {
+        pval[pval[["TaxName"]] == t, paste0("pval.", g)] <- 1
+      } else if (test_type == "parametric") {
+        pval[pval[["TaxName"]] == t, paste0("pval.", g)] <- t.test(subset(plot_dat, 
+                                                                          TaxName == t & Group == g)[["Delta"]],
+                                                                   subset(plot_dat, TaxName == t & Group == control_delta)[["Delta"]], 
+                                                                   paired = TRUE)[["p.value"]]
+      } else if (test_type == "non-parametric") {
+        pval[pval[["TaxName"]] == t, paste0("pval.", g)] <- wilcox.test(subset(plot_dat, 
+                                                                               TaxName == t & Group == g)[["Delta"]], 
+                                                                        subset(plot_dat, 
+                                                                               TaxName == t & Group == control_delta)[["Delta"]],
+                                                                        paired = TRUE)[["p.value"]]
+      }
+    }
+  }
+
+  ## Add to data frame
+  plot_dat_SE[["pval"]] <- NA
+  for (t in pval[["TaxName"]]) {
+    for (g in unique(plot_dat[["Group"]])) {
+      if (p_type == "combine") {
+        if (g == control_delta) {
+          plot_dat_SE[plot_dat_SE[["TaxName"]] == t & plot_dat_SE[["Group"]] == g, "pval"] <- pval[pval[["TaxName"]] == t, "pval"]
+        } else {
+          plot_dat_SE[plot_dat_SE[["TaxName"]] == t & plot_dat_SE[["Group"]] == g, "pval"] <- NA
+        }
+      } else if (p_type == "individual") {
+        if (g == control_delta) {
+          plot_dat_SE[plot_dat_SE[["TaxName"]] == t & plot_dat_SE[["Group"]] == g, "pval"] <- NA
+        } else {
+          plot_dat_SE[plot_dat_SE[["TaxName"]] == t & plot_dat_SE[["Group"]] == g, "pval"] <- pval[pval[["TaxName"]] == t, paste0("pval.", g)]
+        }
+      }
+    }
+  }
+      
+  ## Correct for multiple testing
+  which_nonna <- which(!is.na(plot_dat_SE[["pval"]]))
+  plot_dat_SE[["pval_adj"]] <- NA
+  plot_dat_SE[which_nonna, "pval_adj"] <- p.adjust(as.numeric(plot_dat_SE[which_nonna, ][["pval"]]), method = "fdr", n = nrow(plot_dat_SE[which_nonna, ]))
+  
+  ## Convert to star format
+  plot_dat_SE[["pval_adj_star"]] <- case_when(plot_dat_SE[["pval_adj"]] <= 0.001 ~ "***",
+                                              plot_dat_SE[["pval_adj"]] <= 0.01  ~ "**",
+                                              plot_dat_SE[["pval_adj"]] <= 0.05  ~ "*",
+                                              TRUE ~ "")
+
+  ## Create FormattedTaxName in plot_dat to match plot_dat_se for geom_jitter()
+  plot_dat <- plot_dat %>%
+    # remove "[]", "_" from taxa names
+    dplyr::mutate(TaxName = gsub("\\[|\\]|_", " ", TaxName)) %>%
+    ## remove leading and trialing spaces!
+    dplyr::mutate(TaxName = trimws(TaxName)) %>%
+    ## remove instances of double spaces
+    dplyr::mutate(TaxName = gsub("  ", " ", TaxName)) %>%
+    ## Italicising taxa names
+    dplyr::mutate(
+      FormattedTaxName = 
+        ifelse(
+        ## keep uncultured as normal text
+        grepl("^uncultured", TaxName),
+        gsub("^(uncultured) (.+)$", "\\1 *\\2*", TaxName),
+        ## Keep Other as normal text (i.e. not italicised) and wrap taxa names with "*"
+        ifelse(TaxName %in% c("Other"),
+               TaxName, paste("*", TaxName, "*", sep = "")))) %>%
+    ## insert line break in long taxa names
+    dplyr::mutate(FormattedTaxName = ifelse(FormattedTaxName == "*Ruminococcus torques group*",
+                                            "*Ruminococcus<br>torques group*",
+                                            FormattedTaxName),
+                  FormattedTaxName = ifelse(FormattedTaxName == "*Eubacterium hallii group*",
+                                            "*Eubacterium<br>hallii group*",
+                                            FormattedTaxName),
+                  FormattedTaxName = ifelse(FormattedTaxName == "uncultured *bacterium*",
+                                            "uncultured<br>*bacterium*",
+                                            FormattedTaxName))
+  
+  ## Plot the data
+  plot_dat_SE %>%
+    ## remove "[]", "_" from taxa names
+    dplyr::mutate(TaxName = gsub("\\[|\\]|_", " ", TaxName)) %>%
+    ## remove leading and trialing spaces!
+    dplyr::mutate(TaxName = trimws(TaxName)) %>%
+    ## remove instances of double spaces
+    dplyr::mutate(TaxName = gsub("  ", " ", TaxName)) %>%
+    ## Italicising taxa names
+    dplyr::mutate(
+      FormattedTaxName = 
+        ifelse(
+        ## keep uncultured as normal text
+        grepl("^uncultured", TaxName),
+        gsub("^(uncultured) (.+)$", "\\1 *\\2*", TaxName),
+        ## Keep Other as normal text (i.e. not italicised) and wrap taxa names with "*"
+        ifelse(TaxName %in% c("Other"),
+               TaxName, paste("*", TaxName, "*", sep = "")))) %>%
+    ## insert line break in long taxa names
+    dplyr::mutate(FormattedTaxName = ifelse(FormattedTaxName == "*Ruminococcus torques group*",
+                                            "*Ruminococcus<br>torques group*",
+                                            FormattedTaxName),
+                  FormattedTaxName = ifelse(FormattedTaxName == "*Eubacterium hallii group*",
+                                            "*Eubacterium<br>hallii group*",
+                                            FormattedTaxName),
+                  FormattedTaxName = ifelse(FormattedTaxName == "uncultured *bacterium*",
+                                            "uncultured<br>*bacterium*",
+                                            FormattedTaxName)) %>%
+    ggplot(aes(x = average,
+               y = reorder(FormattedTaxName, average),
+               color = factor(Group, levels = c("Hypoxia", "Sham"))), ## flip factor level
+               color = Group) +
+    geom_jitter(data = plot_dat,
+                aes(x = Delta, y = reorder(FormattedTaxName, Delta),
+                    factor(Group, levels = c("Hypoxia", "Sham")), ## flip factor level
+                    color = Group),
+                position = position_jitterdodge(jitter.width = 0.6),
+                size = 2,
+                alpha = 0.4) +
+    geom_point(position = position_dodge(0.9),
+               size = 4.5) +
+    geom_errorbarh(aes(xmin = average - variability,
+                       xmax = average + variability),
+                   height = 0.4,
+                   position = position_dodge(0.9)) +
+    labs(x = "Δ Relative Abundance",
+         y = "",
+         color = "Group") +
+    scale_x_continuous(labels = scales::label_percent(scale = 1)) +
+    scale_color_manual(values = group_cols) +
+    theme_classic() +
+    theme(
+      text = font,
+      axis.title.x = element_text(size = 20),
+      axis.text.x = element_text(size = 16),
+      axis.text.y = element_markdown(size = 16, colour = "black"),
+      legend.title = element_text(size = 22, face = "bold"),
+      legend.text  = element_text(size = 18),
+      panel.grid.major.x = element_line(colour = "darkgrey", linewidth = 0.25)
+      )
+}
+```
+
+### Phylum
+``` {r Section4_plot_abundance_comparison_delta_phylum, fig.height = 10, fig.width = 8}
+phylum_abun_barplot <- plot_abundance_comparison_delta("Phylum", nclass = 5)
+phylum_abun_barplot
+
+## Data
+print(phylum_abun_barplot$data, n = 10)
+```
+
+### Class
+``` {r Section4_plot_abundance_comparison_delta_class, fig.height = 10, fig.width = 8}
+class_abun_barplot <- plot_abundance_comparison_delta("Class")
+class_abun_barplot
+
+## Data
+print(class_abun_barplot$data, n = 22)
+```
+
+### Order
+``` {r Section4_plot_abundance_comparison_delta_order, fig.height = 10, fig.width = 8}
+order_abun_barplot <- plot_abundance_comparison_delta("Order")
+order_abun_barplot
+
+## Data
+print(order_abun_barplot$data, n = 30)
+```
+
+### Family
+``` {r Section4_plot_abundance_comparison_delta_family, fig.height = 10, fig.width = 8}
+family_abun_barplot <- plot_abundance_comparison_delta2("Family")
+family_abun_barplot
+
+## Data
+print(family_abun_barplot$data, n = 30)
+```
+
+### Genus
+``` {r Section4_plot_abundance_comparison_delta_genus, fig.height = 10, fig.width = 8}
+genus_abun_barplot <- plot_abundance_comparison_delta2("Genus", nclass = 15)
+genus_abun_barplot
+
+## Data
+print(genus_abun_barplot$data, n = 30)
+```
+
+
+# Section 4: Differential Abundance Analysis
+
+## DESeq2
+
+In this section, we will use the [DESeq2](https://bioconductor.org/packages/release/bioc/html/DESeq2.html) and [ALDEx2](https://bioconductor.org/packages/3.19/bioc/html/ALDEx2.html) package in R to identify differentially abundant taxa between the conditions. We will deem taxa as significantly expressed if both packages agree. 
+
+### Setup
+
+``` {r Section4_DESeq2_analysis_setup}
+deseq_dat <- phyloseq_dat_deseq ## Run DESeq2 on non-rarefied feature table
+deseq_plot <- phyloseq_dat_norm_melt ## plot the abundance non-rarefied feature table
+```
+
+### Model
+
+``` {r Section4_DESeq2_analysis_model}
+dds <- phyloseq_to_deseq2(deseq_dat, design = ~ Rep + Group) ## Account for within-sample variation
+dds <- DESeq(dds, test = "LRT", fitType = "parametric", sfType = "poscounts", reduced = ~ Rep)
+plotDispEsts(dds)
+resultsNames(dds)
+```
+
+### Functions
+
+``` {r Section4_DESeq2_analysis_function}
+## Function to take the results from a specific contrast from DESeq2 and return a significance table
+signif_OTU <- function (diff_OTU) {
+  diff_OTU <- subset(diff_OTU, !is.na(padj) & padj <= 0.05 & abs(log2FoldChange) >= 1)
+  if(nrow(diff_OTU) == 0) return(diff_OTU)
+  diff_OTU <- cbind(as(diff_OTU, "data.frame"), as(tax_table(deseq_dat)[rownames(diff_OTU), ], "matrix"))
+  diff_OTU <- diff_OTU[order(diff_OTU[["padj"]], decreasing = FALSE),]
+  diff_OTU[["OTU"]] <- rownames(diff_OTU)
+  diff_OTU[["OTU_num"]] <- 1:nrow(diff_OTU)
+  return(diff_OTU)
+}
+
+## Function to plot a specific OTU
+plot_OTU <- function (otu) {
+    ggplot(subset(deseq_plot, OTU == otu),
+           aes(x = Group, y = Abundance, fill = Group)) +
+        geom_boxplot() + 
+        ggtitle(paste(c(otu, as.character(unlist(subset(deseq_plot, OTU == otu)[1, c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus")]))), collapse = "; ")) + 
+        labs(x = "", y = "Relative Abundance (%)") + 
+        theme(plot.title = element_text(size = 8),
+              axis.title   = element_text(size = 18),
+              axis.text.y  = element_text(size = 16),
+              axis.text.x  = element_text(angle = 90, hjust = 1, size = 24),
+              legend.text  = element_text(size = 22),
+              legend.title = element_text(size = 22, face = "bold")
+              )
+}
+
+## Function to process a specific comparison
+diff_out <- function (i, j) {
+  
+    ## Get the significant OTUs
+    if (i == j) {
+      cat ("Error: ", i, " and ", j, " must be different\n")
+      return (NULL)
+    }
+    all_OTU <- results(dds, contrast = c("Group", i, j), cooksCutoff = FALSE)
+    diff_OTU <- signif_OTU(all_OTU)
+    if(nrow(diff_OTU) == 0) {
+      cat ("Error: No significant differences identified for ", i, " vs ", j, "\n")
+    }
+    
+    ## Save the results
+    write.table(diff_OTU, paste0(analysis_dir, "/tabs/SIGNIF_OTUs_", i, "_vs_", j, "_log2foldchange.csv"), 
+                row.names = FALSE, col.names = TRUE, sep = ",", quote = FALSE)
+    
+    ## Return the results
+    return (list("All"    = all_OTU,
+                 "Signif" = diff_OTU,
+                 "Up"     = subset(diff_OTU, log2FoldChange > 0),
+                 "Down"   = subset(diff_OTU, log2FoldChange < 0)))
+}
+
+## Function to plot a volcano plot for the resulkts
+plot_volcano <- function (x) {
+  if (length(x) == 0) return()
+  par(mar = c(4,4,3,1), las = 1, mgp = c(2,0.7,0), tcl = -0.3)
+  plot_dat   <- x[["All"]]
+  plot_col   <- rep("black", nrow(plot_dat))
+  which_down <- which(rownames(plot_dat) %in% rownames(x[["Down"]]))
+  which_up   <- which(rownames(plot_dat) %in% rownames(x[["Up"]]))
+  plot_col[which_down] <- "blue"
+  plot_col[which_up]   <- "red"
+  plot(x = plot_dat[["log2FoldChange"]], y = -log10(plot_dat[["padj"]]),
+       xlab = "log2(Fold Change)", ylab = "-log10(P Value)",
+       col = plot_col, cex.lab = 1.7, cex.main = 1.9, cex.axis = 1.6,
+       xlim = c(-max(abs(plot_dat[["log2FoldChange"]]), na.rm = TRUE), max(abs(plot_dat[["log2FoldChange"]]), na.rm = TRUE)))
+  abline(h = -log10(0.05), lty = 2)
+  abline(v =  log2(2),    lty = 2)
+  abline(v = -log2(2),    lty = 2)
+}
+
+## Function to get the top hits from the DESeq2 analysis
+get_top_hits <- function(x, n = 10) {
+  if (nrow(x[["Signif"]]) == 0) return(NULL)
+  
+  # Get the top up and downregulated hits
+  positive_df <- head(x[["Up"]][order(x[["Up"]][["log2FoldChange"]], decreasing = TRUE), ], min(n, nrow(x[["Up"]])))
+  negative_df <- tail(x[["Down"]][order(x[["Down"]][["log2FoldChange"]], decreasing = TRUE), ], min(n, nrow(x[["Down"]])))
+  df <- rbind.data.frame(positive_df, negative_df)
+  df[["Direction"]] <- c(rep("Increase", min(n, nrow(x[["Up"]]))), rep("Decrease", min(n, nrow(x[["Down"]]))))
+  
+  # Set the sample names from the "Genus" column
+  df[["Taxa"]] <- factor(paste(otu_or_asv, df[["OTU_num"]], ": ", df[["Genus"]], sep = ""), 
+                                 levels = paste(otu_or_asv, df[["OTU_num"]], ": ", df[["Genus"]], sep = ""))
+  
+  # Create a bar plot using the log2FoldChange values and updated sample names, with colored bars
+  df %>%
+    ggplot(aes(x = Taxa, y = log2FoldChange, fill = Direction)) +
+    geom_bar(stat='identity') +
+    coord_flip() +
+    scale_fill_manual(values = c('Increase' = "#56B4E9", 'Decrease' = "#D55E00")) +
+    ylab("log2 Fold Change") + xlab("") +
+    theme_bw() +
+    theme(axis.title   = element_text(size = 18),
+          axis.text.y  = element_text(size = 18, face = "bold"),
+          axis.text.x  = element_text(size = 16),
+          legend.position = "none")   
+}
+```
+
+### Post-Sham vs Pre-Sham
+The following results show the differentially abundant taxa. 
+
+``` {r Section4_DESeq2_analysis_post-sham_vs_pre-sham}
+DE_PostSvPreS <- diff_out("Post-Sham", "Pre-Sham")
+cat("Total number of differentially abundant OTUs: ", nrow(DE_PostSvPreS[["Signif"]]))
+cat("Upregulated number of differentially abundant OTUs: ", nrow(DE_PostSvPreS[["Up"]]))
+cat("Downregulated number of differentially abundant OTUs: ", nrow(DE_PostSvPreS[["Down"]]))
+```
+
+Below is a volcano plot showing the overall differential abundance results for this comparison.
+
+``` {r Section4_DESeq2_analysis_post-sham_vs_pre-sham_volcano, fig.height = 8, fig.width = 12}
+plot_volcano(DE_PostSvPreS)
+```
+
+And here are the taxa showing the highest increase or decrease between the groups. (Null if no differences)
+
+``` {r Section4_DESeq2_analysis_post-sham_vs_pre-sham_tophits, fig.height = 8, fig.width = 10}
+get_top_hits(DE_PostSvPreS)
+```
+
+### Post-Hypoxia vs Pre-Hypoxia
+The following results show the differentially abundant taxa. 
+
+``` {r Section4_DESeq2_analysis_post-hypoxia_vs_pre-hypoxia}
+DE_PostHvPreH <- diff_out("Post-Hypoxia", "Pre-Hypoxia")
+cat("Total number of differentially abundant OTUs: ", nrow(DE_PostHvPreH[["Signif"]]))
+cat("Upregulated number of differentially abundant OTUs: ", nrow(DE_PostHvPreH[["Up"]]))
+cat("Downregulated number of differentially abundant OTUs: ", nrow(DE_PostHvPreH[["Down"]]))
+```
+
+Below is a volcano plot showing the overall differential abundance results for this comparison.
+
+``` {r Section4_DESeq2_analysis_post-hypoxia_vs_pre-hypoxia_volcano, fig.height = 8, fig.width = 12}
+plot_volcano(DE_PostHvPreH)
+```
+
+And here are the taxa showing the highest increase or decrease between the groups. (Null if no differences)
+
+``` {r Section4_DESeq2_analysis_post-hypoxia_vs_pre-hypoxia_tophits, fig.height = 8, fig.width = 10}
+get_top_hits(DE_PostHvPreH)
+```
+
+## ALDEx2
+
+### Setup
+
+```{r Section4_ALDEx2_setup}
+## create groupings variable from phyloseq object
+## groupings1 = sham post vs pre
+sham_group = c("Post-Sham", "Pre-Sham")
+## Convert sample_data to a data frame
+sample_df <- as(sample_data(phyloseq_dat_deseq), "data.frame")
+## Filter the data frame for the sham group
+groupings_sham_df <- sample_df %>%
+  dplyr::filter(Group %in% sham_group) %>%
+  dplyr::select(Group, Rep) %>%
+  dplyr::mutate(Group = factor(Group, levels = c("Pre-Sham", "Post-Sham")))
+## save sham rownames
+rownames_sham <- rownames(groupings_sham_df)
+## Convert the filtered sham data frame to a character matrix
+groupings_sham <- as.character(groupings_sham_df$Group)
+
+## groupings2 = hypoxia post vs pre
+hypoxia_group = c("Post-Hypoxia", "Pre-Hypoxia")
+## Filter the data frame for the hypoxia group
+groupings_hypoxia_df <- sample_df %>%
+  dplyr::filter(Group %in% hypoxia_group) %>%
+  dplyr::select(Group, Rep) %>%
+  dplyr::mutate(Group = factor(Group, levels = c("Pre-Hypoxia", "Post-Hypoxia")))
+## save hypoxia rownames
+rownames_hypoxia <- rownames(groupings_hypoxia_df)
+## Convert the filtered hypoxia data frame to a character matrix
+groupings_hypoxia <- as.character(groupings_hypoxia_df$Group)
+
+## create OTU_table from phyloseq object
+OTU_table = otu_table(phyloseq_dat_deseq)
+## OTU_table for sham group, filter colnames of OTU_table by "rownames_sham"
+OTU_table_sham = OTU_table[, rownames_sham]
+## Convert OTU_table_sham to a regular matrix
+OTU_matrix_sham = as.matrix(OTU_table_sham@.Data)
+## OTU_table for hypoxia group, filter colnames of OTU_table by "rownames_hypoxia"
+OTU_table_hypoxia = OTU_table[, rownames_hypoxia]
+## Convert OTU_table_hypoxia to a regular matrix
+OTU_matrix_hypoxia = as.matrix(OTU_table_hypoxia@.Data)
+
+## Quality check for sham
+if (length(groupings_sham) == ncol(OTU_table_sham)) {
+  message("PASS: Length of groupings_sham and number of columns in OTU_table_sham are equal.")
+} else {
+  message("ERROR: Length of groupings_sham and number of columns in OTU_table_sham are not equal.")
+}
+## Quality check for hypoxia
+if (length(groupings_hypoxia) == ncol(OTU_table_hypoxia)) {
+  message("PASS: Length of groupings_sham and number of columns in OTU_table_sham are equal.")
+} else {
+  message("ERROR: Length of groupings_sham and number of columns in OTU_table_sham are not equal.")
+}
+```
+
+### Post-Sham vs Pre-Sham
+
+```{r Section4_ALDEx2_model_sham}
+## Create the model matrix
+mm <- model.matrix(~ Rep + Group, data = groupings_sham_df)
+## run aldex.clr on OTU_table and mm
+x_sham <- aldex.clr(OTU_matrix_sham,
+                    conds = mm,
+                    mc.samples = 4, 
+                    denom = "all", 
+                    verbose = TRUE)
+## run aldex.glm
+glm.test <- aldex.glm(x_sham,
+                      verbose = TRUE,
+                      fdr.method = "BH")
+glm.eff <- aldex.glm.effect(x_sham)
+## Plot glm.test and glm.eff data for contrast of interest
+aldex.glm.plot(glm.test, eff=glm.eff, contrast="GroupPost-Sham", type='MW', post.hoc='fdr')
+
+## Filter glm.test by padj < 0.05 to determine if we have significantly expressed OTUs between Post-Sham vs Pre-Sham
+glm.test %>%
+  dplyr::select("GroupPost-Sham:pval.padj") %>%
+  dplyr::filter("GroupPost-Sham:pval.padj" < 0.05)
+## unique padj values
+unique(glm.test$"GroupPost-Sham:pval.padj")
+```
+
+### Post-Hypoxia vs Pre-Hypoxia
+
+```{r Section4_ALDEx2_model_hypoxia}
+## Create the model matrix
+mm <- model.matrix(~ Rep + Group, data = groupings_hypoxia_df)
+## run aldex.clr on OTU_table and mm
+x_hypoxia <- aldex.clr(OTU_matrix_hypoxia,
+                      conds = mm,
+                      mc.samples = 4, 
+                      denom = "all", 
+                      verbose = TRUE)
+## run aldex.glm
+glm.test <- aldex.glm(x_hypoxia,
+                      verbose = TRUE,
+                      fdr.method = "BH")
+glm.eff <- aldex.glm.effect(x_hypoxia)
+## Plot glm.test and glm.eff data for contrast of interest
+aldex.glm.plot(glm.test, eff=glm.eff, contrast="GroupPost-Hypoxia", type='MW', post.hoc='fdr')
+
+## Filter glm.test by padj < 0.05 to determine if we have significantly expressed OTUs between Post-Hypoxia vs Pre-Hypoxia
+glm.test %>%
+  dplyr::select("GroupPost-Hypoxia:pval.padj") %>%
+  dplyr::filter("GroupPost-Hypoxia:pval.padj" < 0.05)
+## unique padj values
+unique(glm.test$"GroupPost-Hypoxia:pval.padj")
+```
+
+# Section 5: Positive Control Analysis
+This data set contained samples generated from the [Zymobiomics Microbial Community Standard](https://zymoresearch.eu/collections/zymobiomics-microbial-community-standards/products/zymobiomics-microbial-community-standard). This is used to assess bias and errors in the extraction methods and identify potential contamination across the data set. 
+
+## Theoretical distribution
+These samples have a theoretical Composition Based on Genomic DNA which should be represented in the output distributions following data processing alongside the other samples in the data set. This distribution is as follows:
+
+Listeria monocytogenes - 12%, Pseudomonas aeruginosa - 12%, Bacillus subtilis - 12%, Escherichia coli - 12%, Salmonella enterica - 12%, Lactobacillus fermentum - 12%, Enterococcus faecalis - 12%, Staphylococcus aureus - 12%, Saccharomyces cerevisiae - 2%, and Cryptococcus neoformans - 2%
+
+Note that only the bacterial species (all excluding Saccharomyces cerevisiae and Cryptococcus neoformans) will be identified through 16S rRNA amplicon based sequencing. The theoretical distribution for only the bacterial species is shown below:
+
+``` {r Section5_PC_barplot_theoretical_abundance_stacked, fig.height = 6, fig.width = 6}
+theo <- data.frame(species = c("*Listeria monocytogenes*", "*Pseudomonas aeruginosa*", 
+                               "*Bacillus subtilis*", "*Escherichia coli*", 
+                               "*Salmonella enterica*", "*Lactobacillus fermentum*", 
+                               "*Enterococcus faecalis*", "*Staphylococcus aureus*"),
+                   percent = rep(12.5, 8),
+                   rep     = "1")
+
+ggplot(theo, aes(x = rep, 
+                 y = percent, 
+                 fill = species)) + 
+  geom_bar(stat = "identity") +
+  scale_y_continuous(labels = scales::label_percent(scale = 1),
+                     expand = expansion(add = c(0, 1))) +
+  labs(x = "", 
+       y = "Relative Abundance") + 
+  theme_bw() +
+  theme(
+    text = font,
+    axis.title   = element_text(size = 18),
+    axis.text.y  = element_text(size = 16),
+    axis.text.x  = element_blank(),
+    legend.text  = element_markdown(size = 16),
+    legend.title = element_blank(),
+    strip.text.x = element_text(size = 16, face = "bold"),
+    strip.text.y = element_text(size = 16, face = "bold")
+    ) +
+  guides(fill = guide_legend(ncol = 1))
+```
+
+The total number of taxa (in thousands) for the PC samples is shown below.
+
+``` {r Section5_QC_OTU_count_PC, fig.height = 6, fig.width = 10}
+data.frame(sample_data(phyloseq_dat_PC)) %>%
+  dplyr::mutate(count = sample_sums(phyloseq_dat_PC)) %>%
+  ggplot(aes(x = Rep, y = count/1000, fill = Rep)) +
+  geom_bar(stat = "identity", position = "dodge", color = "black") +
+  xlab("") + ylab(paste0("Total Number ", otu_or_asv, "s (x1000)")) +
+  facet_wrap(.~Group, scales = "free_x") +
+  geom_hline(yintercept = min_otus/1000, linetype = 2, linewidth = 1.2) +
+  theme_bw() +
+  theme(text = font,
+        axis.title   = element_text(size = 18),
+        axis.text.y  = element_text(size = 12),
+        axis.text.x  = element_text(size = 14, angle = 315, face = "bold", hjust = 0),
+        legend.position = "none",
+        strip.text.x = element_text(size=20, face = "bold"),
+        strip.text.y = element_text(size=16, face = "bold")
+  )
+```
+
+Then we filter to remove the samples with too few taxa, rarefy to the depth of the lowest sample, and normalise to percentage abundance as we did above.
+
+``` {r Section5_PC_analysis_setup}
+## Filter to remove samples with fewer than min_otus
+phyloseq_dat_PC_filter <- prune_samples(sample_sums(phyloseq_dat_PC) >= min_otus, phyloseq_dat_PC)
+
+## Rarefy the data to the minimum otu depth
+rarefy_otu_depth <- min(sample_sums(phyloseq_dat_PC_filter))
+cat("Rarefication of data to", rarefy_otu_depth, "OTUs:\n")
+phyloseq_dat_PC_filter <- rarefy_even_depth(phyloseq_dat_PC_filter, rarefy_otu_depth, verbose = FALSE)
+
+## Normalise the data
+phyloseq_dat_PC_filter_norm <- transform_sample_counts(phyloseq_dat_PC_filter, function (x) 100* ((x+1) / sum(x+1)))
+
+## Create data for barplots
+phyloseq_dat_PC_filter_norm_melt <- psmelt(phyloseq_dat_PC_filter_norm) %>%
+  dplyr::mutate(Genus = ifelse (Genus == "Limosilactobacillus", "Lactobacillus", Genus)) %>% 
+  dplyr::mutate(Genus = ifelse (Genus == "Escherichia-Shigella", "Escherichia", Genus))
+```
+
+## Chi-squared
+
+Below is a chi-squared based comparison between the PC replicates against the expected distribution:
+
+``` {r Section_5_PC_comparison_with_expected}
+## Get the theoretical distribution
+PC_comp <- theo %>%
+  ## remove "*" from names
+  dplyr::mutate(species = gsub("\\*", "", species))
+PC_comp[["Genus"]] <- gsub(" .*$", "", PC_comp[["species"]])
+PC_comp <- PC_comp[, c("Genus", "percent")]
+names(PC_comp)[2] <- "Zymo"
+
+## Get the abundance for all of the species in the positive control
+PC_abun <- phyloseq_dat_PC_filter_norm_melt %>% 
+  dplyr::group_by(Genus, Sample) %>% 
+  dplyr::summarise(Abundance = sum(Abundance)) %>%
+  dplyr::ungroup() %>%
+  filter(Genus %in% PC_comp[["Genus"]]) %>% 
+  tidyr::spread(Sample, Abundance)
+
+## Combine and save
+PC_abun_merge <- merge(PC_comp, PC_abun, by = "Genus")
+write.table(PC_abun_merge, paste0(analysis_dir, "/tabs/PC_abundance_comparison.csv"), sep = ",", row.names = FALSE, col.names = TRUE, quote = FALSE)
+
+## Chi-squared test
+csqtest <- chisq.test(PC_abun_merge[, -1])
+csqtest
+```
+
+## Plot
+
+The distribution of taxa at the Genus level is shown below for the PC samples:
+
+``` {r Section5_PC_barplot_top_genus_normalised_abundance_stacked, fig.height = 8, fig.width = 6}
+genus_plot_PC <- plot_barplot2("Genus", phyloseq_dat_PC_filter_norm_melt, nclass = 8)
+genus_plot_PC[[1]]
+
+## chi-squared stats
+stat <- round(csqtest$statistic,3)
+df <- csqtest$parameter
+p_value <- round(csqtest$p.value, 3)
+
+## title
+title <- bquote("Chi-Squared: " ~ {X^2}["(" * .(df) * ")"] ~ "=" ~ .(stat) * ", " ~ italic(p) ~ "=" ~ .(p_value))
+
+PC_plot <- genus_plot_PC[[1]] +
+  labs(title = title) +
+  theme(
+      text         = font,
+      title        = element_text(size = 18),
+      axis.title   = element_text(size = 24),
+      axis.text.y  = element_text(size = 16),
+      axis.text.x  = element_text(size = 22, angle = 90, vjust = 0.5),
+      legend.text  = element_markdown(size = 14),
+      legend.title = element_blank(),
+      legend.position = "right",
+      strip.text.x = element_text(size=26, face = "bold")
+      ) 
+
+PC_plot
+```
+
+# Section 6: Negative Control Analysis
+
+## Taxa count
+The total number of taxa for the NFW samples is shown below. This should be as low as possible for all replicates 
+
+``` {r Section6_QC_OTU_count_NFW, fig.height = 6, fig.width = 8}
+NC_plot <- data.frame(sample_data(phyloseq_dat_NFW)) %>%
+  dplyr::mutate(count = sample_sums(phyloseq_dat_NFW)) %>%
+  ggplot(aes(x = Rep, y = count, fill = Rep)) +
+  geom_bar(stat = "identity", position = "dodge", color = "black") +
+  xlab("") + ylab(paste0("Total Number ", otu_or_asv, "s")) +
+  facet_wrap(.~Group, scales = "free_x") +
+  theme_bw() +
+  theme(text = font,
+        axis.title   = element_text(size = 18),
+        axis.text.y  = element_text(size = 16),
+        axis.text.x  = element_text(size = 22, angle = 90, vjust = 0.5),
+        legend.position = "none",
+        strip.text.x = element_text(size=26, face = "bold")
+  )
+
+NC_plot
+```
+
+Then we filter normalise to percentage abundance as we did above (note that we are not filtering or rarefying these sample, as we want to observe the negative influences on the data).
+
+``` {r Section6_NFW_analysis_setup}
+## Normalise the data
+phyloseq_dat_NFW_filter_norm <- transform_sample_counts(phyloseq_dat_NFW, function (x) 100* ((x+1) / sum(x+1)))
+
+## Create data for barplots
+phyloseq_dat_NFW_filter_norm_melt <- psmelt(phyloseq_dat_NFW_filter_norm)
+```
+
+## Plot
+
+The distribution of taxa at the Genus level is shown below for the NFW samples (note that these data are NOT filtered, as this would remove all samples - so this is based on very low levels of reads). Note that this plot may be influenced by the fact that all taxa had one added to them when normalising to avoid divide by zero errors, so if the read count is low then this plot can be ignored.
+
+``` {r Section6_NFW_barplot_top_genus_normalised_abundance_stacked, fig.height = 8, fig.width = 6}
+genus_dat_NFW <- plot_barplot2("Genus", phyloseq_dat_NFW_filter_norm_melt)
+genus_dat_NFW[[1]] + 
+  theme(
+      text = font,
+      axis.title   = element_text(size = 24),
+      axis.text.y  = element_text(size = 16),
+      axis.text.x  = element_text(size = 22, angle = 90, vjust = 0.5),
+      legend.text  = element_markdown(size = 14),
+      legend.title = element_blank(),
+      legend.position = "right",
+      strip.text.x = element_text(size=26, face = "bold")
+      ) 
+```
+
+# Section 7: Figures
+
+## Diveristy and Abundance Panel
+
+```{r Section7_diversity_abundance_panel, fig.height = 20, fig.width = 20}
+## Remove legend from phylum abundance barplot
+phylum_abun_barplot2 <- phylum_abun_barplot + 
+  theme(legend.position = "none") +
+  theme(plot.margin = margin(0, 0.6, 0, 0, "cm")) ## increase right margin as the % sign was being cut off from removing the legend
+
+## Adjust the widths for each plot
+plot_widths <- c(1, 1, 0.5)  
+
+## Arrange the figures
+arrange_row1 <- ggarrange(adiv_plot, 
+                          bdiv_plot,
+                          ncol = 2, 
+                          labels = LETTERS[1:2], 
+                          font.label = list(size = 20, 
+                                            face = "bold", 
+                                            family = "serif"))
+
+arrange_row2 <- ggarrange(phylum_barplot, 
+                          phylum_abun_barplot2, 
+                          fbratio_delta_plot,
+                          ncol = 3, 
+                          labels = LETTERS[3:5], 
+                          font.label = list(size = 20, 
+                                            face = "bold", 
+                                            family = "serif"), 
+                          widths = plot_widths)
+
+arrange_row3 <- ggarrange(genus_barplot, 
+                          genus_abun_barplot, 
+                          ncol = 2, 
+                          labels = LETTERS[6:7], 
+                          font.label = list(size = 20, 
+                                            face = "bold", 
+                                            family = "serif"))
+
+div_abun_panel <- ggarrange(arrange_row1, 
+                            arrange_row2, 
+                            arrange_row3,  
+                            nrow = 3)
+
+## view 
+div_abun_panel
+```
+
+## Controls Panel
+
+```{r Section7_pos_neg_control_panel, fig.height = 10, fig.width = 14}
+## create positive and negative control panel
+P_N_con_panel <- ggarrange(PC_plot, NC_plot,
+                           labels = LETTERS[1:2],
+                           font.label = list(size = 20, 
+                                             face = "bold", 
+                                             family = "serif"),
+                           vjust = 1.0,
+                           ncol = 2, 
+                           nrow = 1)
+
+## view 
+P_N_con_panel
+```
+
+# Session Info
+``` {r sessionInfo}
+sinfo <- sessionInfo()
+sinfo
+save(list = ls()[ls() != "analysis_dir"], file = paste0(analysis_dir, "/T2D_hypoxia_analysis_delta_emu_manuscript.Rout"))
+```
