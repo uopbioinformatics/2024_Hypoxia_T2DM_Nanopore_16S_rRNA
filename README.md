@@ -1,5 +1,5 @@
 # 2024_Hypoxia_T2DM_Nanopore_16S_rRNA
-Full data analysis scripts and input files for publication 'Impact of nocturnal hypoxia on glycaemic control, appetite, gut microbiota and inflammation in adults with T2DM: A single-blind crossover trial' by Shepherd _et al._ (in review). These scripts and data can be used to replicate the analyses presented in the manuscript.
+Full data analysis scripts and input files for publication 'Impact of nocturnal hypoxia on glycaemic control, appetite, gut microbiota and inflammation in adults with T2DM: A single-blind crossover trial' by Shepherd _et al._ (2024). These scripts and data can be used to replicate the analyses presented in the manuscript. https://doi.org/10.1113/JP285322
 
 Below is a brief description of the files:
 
